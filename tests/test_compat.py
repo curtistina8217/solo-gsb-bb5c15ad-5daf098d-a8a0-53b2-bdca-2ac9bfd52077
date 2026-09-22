@@ -228,6 +228,200 @@ class TestCounterexamples:
                 f"反例未违反 target: {ce} / {issue}"
 
 
+class TestConditional:
+    """if / then / else 条件分支（draft-07+）。
+
+    判定规则：
+    * 按实例是否命中 if 选择 then / else 分区递归比较；
+    * 仅当构造出的文档满足 source 且被 target 拒绝时输出 error + 最小反例，
+      否则输出 warning；
+    * 未激活分支上的纯结构差异不得判为破坏（error）。
+    """
+
+    def test_then_branch_tightened_same_condition(self):
+        old = {"if": {"required": ["kind"]},
+               "then": {"properties": {"x": {"type": "string"}}}}
+        new = {"if": {"required": ["kind"]},
+               "then": {"properties": {"x": {"type": "integer"}}}}
+        report = analyze(old, new)
+        assert not report["backward_compatible"]
+        issue = [i for i in report["issues"]
+                 if i["direction"] == "backward" and i["code"] == "type_removed"][0]
+        # issue.path 定位到发生变化的分支
+        assert issue["path"] == "#/then/properties/x"
+        assert issue["severity"] == "error"
+        ce = issue["counterexample"]
+        # 反例命中 if、满足旧版 then、被新版 then 拒绝
+        assert "kind" in ce and ce["x"] == ""
+        assert compat.make_validator(old).is_valid(ce)
+        assert not compat.make_validator(new).is_valid(ce)
+
+    def test_else_branch_tightened_same_condition(self):
+        old = {"if": {"required": ["kind"]},
+               "else": {"properties": {"x": {"type": "string"}}}}
+        new = {"if": {"required": ["kind"]},
+               "else": {"properties": {"x": {"type": "integer"}}}}
+        report = analyze(old, new)
+        assert not report["backward_compatible"]
+        issue = [i for i in report["issues"]
+                 if i["direction"] == "backward" and i["code"] == "type_removed"][0]
+        assert issue["path"] == "#/else/properties/x"
+        # else 分区的反例不得携带 kind（否则命中 if 走 then 分支）
+        assert "kind" not in issue["counterexample"]
+        assert issue["counterexample"]["x"] == ""
+
+    def test_conditional_added_breaks_backward_only(self):
+        old = {"type": "object",
+               "properties": {"kind": {"type": "string"}, "x": {"type": "string"}}}
+        new = {"type": "object",
+               "properties": {"kind": {"type": "string"}, "x": {"type": "string"}},
+               "if": {"required": ["kind"], "properties": {"kind": {"const": "a"}}},
+               "then": {"required": ["y"]}}
+        report = analyze(old, new)
+        assert not report["backward_compatible"]
+        assert report["forward_compatible"]
+        issue = [i for i in report["issues"]
+                 if i["direction"] == "backward" and i["code"] == "required_added"][0]
+        assert issue["path"] == "#/then"
+        assert issue["severity"] == "error"
+        # 反例命中新版的 if（kind = "a"），缺少 then 要求的 y
+        assert issue["counterexample"] == {"kind": "a"}
+
+    def test_conditional_removed_is_backward_compatible(self):
+        old = {"if": {"required": ["kind"]}, "then": {"required": ["x"]}}
+        new = {}
+        report = analyze(old, new)
+        # 移除条件约束是放宽：向后兼容
+        assert report["backward_compatible"]
+        # 但旧版的条件约束会拒绝新版数据：向前不兼容
+        assert not report["forward_compatible"]
+        issue = [i for i in report["issues"]
+                 if i["direction"] == "forward" and i["code"] == "required_added"][0]
+        assert issue["path"] == "#/then"
+        assert issue["severity"] == "error"
+
+    def test_condition_changed_warns_and_locates_if(self):
+        old = {"if": {"required": ["a"]}, "then": {"required": ["x"]}}
+        new = {"if": {"required": ["b"]}, "then": {"required": ["x"]}}
+        report = analyze(old, new)
+        # 条件本身变化：#/if 上记 warning
+        cond = [i for i in report["issues"] if i["code"] == "condition_changed"]
+        assert cond
+        assert all(i["path"] == "#/if" for i in cond)
+        assert all(i["severity"] == "warning" for i in cond)
+        # 命中新 if 但不命中旧 if 的实例被新版 then 拒绝：经验证的 error
+        assert not report["backward_compatible"]
+        err = [i for i in report["issues"]
+               if i["direction"] == "backward" and i["severity"] == "error"]
+        assert err and err[0]["path"].startswith("#/then")
+        assert err[0]["counterexample"] == {"b": None}
+
+    def test_inactive_branch_diff_is_warning_not_error(self):
+        # 旧版数据 a 恒为 2，不可能命中 if（要求 a 为 1）：
+        # then 分支的类型收紧无法构造出经过验证的反例 -> 仅 warning，不判破坏
+        old = {"properties": {"a": {"const": 2}}, "required": ["a"],
+               "if": {"properties": {"a": {"const": 1}}, "required": ["a"]},
+               "then": {"properties": {"x": {"type": "string"}}}}
+        new = {"properties": {"a": {"const": 2}}, "required": ["a"],
+               "if": {"properties": {"a": {"const": 1}}, "required": ["a"]},
+               "then": {"properties": {"x": {"type": "integer"}}}}
+        report = analyze(old, new)
+        assert report["backward_compatible"]
+        issue = [i for i in report["issues"]
+                 if i["direction"] == "backward" and i["code"] == "type_removed"][0]
+        assert issue["path"] == "#/then/properties/x"
+        assert issue["severity"] == "warning"
+        assert issue["counterexample"] is None
+
+    def test_dead_then_branch_if_false_ignored(self):
+        # if:false 下 then 永远不会被激活 -> 不产生任何 issue
+        old = {"type": "object"}
+        new = {"type": "object", "if": False, "then": {"required": ["x"]}}
+        report = analyze(old, new)
+        assert report["backward_compatible"]
+        assert report["forward_compatible"]
+        assert report["issues"] == []
+
+    def test_dead_else_branch_if_true_ignored(self):
+        # if:true 下新增的 else 是死分支 -> 不产生 issue
+        old = {"if": True, "then": {"type": "string"}}
+        new = {"if": True, "then": {"type": "string"}, "else": {"type": "integer"}}
+        report = analyze(old, new)
+        assert report["backward_compatible"]
+        assert report["issues"] == []
+
+    def test_nested_conditional_inside_property(self):
+        old = {"type": "object",
+               "properties": {"addr": {"if": {"required": ["country"]},
+                                       "then": {"required": ["zip"]}}}}
+        new = {"type": "object",
+               "properties": {"addr": {"if": {"required": ["country"]},
+                                       "then": {"required": ["zip", "street"]}}}}
+        report = analyze(old, new)
+        assert not report["backward_compatible"]
+        issue = [i for i in report["issues"]
+                 if i["direction"] == "backward" and i["code"] == "required_added"][0]
+        # 属性内嵌的条件：path 定位到属性下的 then 分支
+        assert issue["path"] == "#/properties/addr/then"
+        assert issue["counterexample"] == {"addr": {"country": None, "zip": None}}
+        assert issue["counterexample_path"] == "#/addr"
+
+    def test_nested_conditional_inside_then(self):
+        old = {"if": {"required": ["a"]},
+               "then": {"if": {"required": ["b"]}, "then": {"required": ["x"]}}}
+        new = {"if": {"required": ["a"]},
+               "then": {"if": {"required": ["b"]}, "then": {"required": ["x", "y"]}}}
+        report = analyze(old, new)
+        assert not report["backward_compatible"]
+        issue = [i for i in report["issues"]
+                 if i["direction"] == "backward" and i["code"] == "required_added"][0]
+        assert issue["path"] == "#/then/then"
+        # 反例同时命中两层 if，缺少最内层 then 要求的 y
+        assert issue["counterexample"] == {"a": None, "b": None, "x": None}
+
+    def test_then_false_forbids_matching_instances(self):
+        old = {"type": "object", "properties": {"kind": {"type": "string"}}}
+        new = {"type": "object", "properties": {"kind": {"type": "string"}},
+               "if": {"required": ["kind"]}, "then": False}
+        report = analyze(old, new)
+        assert not report["backward_compatible"]
+        issue = [i for i in report["issues"]
+                 if i["direction"] == "backward"][0]
+        assert issue["code"] == "schema_forbids_all"
+        assert issue["path"] == "#/then"
+        assert issue["severity"] == "error"
+
+    def test_draft07_schema_keyword_conditionals(self):
+        old = {"$schema": "http://json-schema.org/draft-07/schema#",
+               "if": {"required": ["a"]}, "then": {"required": ["x"]}}
+        new = {"$schema": "http://json-schema.org/draft-07/schema#",
+               "if": {"required": ["a"]}, "then": {"required": ["x", "y"]}}
+        report = analyze(old, new)
+        assert not report["backward_compatible"]
+        issue = [i for i in report["issues"]
+                 if i["direction"] == "backward" and i["code"] == "required_added"][0]
+        assert issue["path"] == "#/then"
+        assert issue["severity"] == "error"
+
+    def test_conditional_counterexamples_are_verified(self):
+        # 条件分支产生的每条 error 反例都必须满足 source、被 target 拒绝
+        old = {"if": {"required": ["kind"], "properties": {"kind": {"const": "a"}}},
+               "then": {"required": ["y"]},
+               "else": {"properties": {"n": {"type": "integer"}}}}
+        new = {"if": {"required": ["kind"], "properties": {"kind": {"const": "a"}}},
+               "then": {"required": ["y", "z"]},
+               "else": {"properties": {"n": {"type": "string"}}}}
+        report = analyze(old, new)
+        errors = [i for i in report["issues"] if i["severity"] == "error"]
+        assert errors
+        for issue in errors:
+            ce = issue["counterexample"]
+            assert ce is not None
+            source, target = (old, new) if issue["direction"] == "backward" else (new, old)
+            assert compat.make_validator(source).is_valid(ce)
+            assert not compat.make_validator(target).is_valid(ce)
+
+
 class TestSamples:
     def test_sample_rejected_by_new(self):
         old = {"type": "object", "properties": {"status": {"type": "string"}}}

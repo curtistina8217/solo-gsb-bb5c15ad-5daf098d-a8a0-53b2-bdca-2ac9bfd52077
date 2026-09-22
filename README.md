@@ -1,8 +1,9 @@
 # JSON Schema 兼容性分析 API
 
 用 **FastAPI + SQLite** 构建的 JSON Schema 兼容性分析服务。提交旧版与新版 JSON Schema
-（以及可选的样例文档），服务会递归比较两者的**类型、必填字段、枚举、数组、对象和组合关键字**，
-分别判断**向后兼容**与**向前兼容**，并为每一处破坏点生成**最小反例路径、反例文档和原因说明**。
+（以及可选的样例文档），服务会递归比较两者的**类型、必填字段、枚举、数组、对象、
+组合关键字与 if/then/else 条件分支**，分别判断**向后兼容**与**向前兼容**，
+并为每一处破坏点生成**最小反例路径、反例文档和原因说明**。
 
 - Web 框架：FastAPI
 - 持久化：SQLite + SQLAlchemy
@@ -25,7 +26,7 @@
 │   ├── models.py        # Analysis ORM 模型
 │   └── schemas.py       # Pydantic 请求 / 响应模型
 ├── tests/
-│   ├── test_compat.py   # 引擎单元测试（30+ 用例）
+│   ├── test_compat.py   # 引擎单元测试（40+ 用例，含 if/then/else 条件分支）
 │   ├── test_compare.py  # 基线对比单元测试
 │   ├── test_gate.py     # 发布门禁单元测试
 │   └── test_api.py      # 接口端到端测试
@@ -108,7 +109,32 @@ pytest -q
   `exclusiveMinimum/Maximum` 数值写法、`multipleOf`
 - `minLength` / `maxLength`、`pattern`
 - 组合关键字：`allOf`（浅合并后比较）、`anyOf`、`oneOf`、`not`
+- 条件关键字：`if` / `then` / `else`（draft-07 及以上，按实例是否命中
+  `if` 选择分支后递归比较）
 - 文档内部 `$ref`（`#/$defs/...`，带环保护）
+
+### 条件分支（if / then / else）的判定
+
+比较含条件关键字的 schema 时，引擎按"实例是否命中 `if`"把实例划分为
+then / else 两个分区分别探测，属性内嵌与嵌套条件同样递归处理：
+
+- **then 分区**：构造命中双方 `if` 的文档，递归比较新旧 `then` 分支；
+- **else 分区**：构造不命中双方 `if` 的文档，递归比较新旧 `else` 分支；
+- 双方 `if` 表达式不一致时，额外探测"命中旧 `if` 不命中新 `if`"与
+  "命中新 `if` 不命中旧 `if`"两个交叉分区，并对条件本身记一条
+  `condition_changed` warning（`issue.path` 为 `#/if`）；
+- 新版新增条件约束视为旧版 `if: true` 且两个分支都是旧版本身，
+  由同一套分区探测覆盖；移除条件约束属于放宽，不破坏该方向。
+
+定级规则与反例可信度一致：仅当构造出的文档**满足源 schema 且被目标
+schema 拒绝**（经 `jsonschema` 双向验证）时才输出 `error` 与最小反例，
+否则输出 `warning`。**未激活分支上的纯结构差异不会被判为破坏**——例如
+旧数据不可能命中 `if` 时，`then` 的收紧只记 warning；`if: false` 下的
+`then`、`if: true` 下的 `else` 等死分支直接跳过。
+
+`issue.path` 定位到发生变化的条件或分支：`#/if`、`#/then`、`#/else`
+（嵌套时如 `#/properties/addr/then`、`#/then/then`）；分支内部的具体
+差异沿用既有 issue 代码（如 `required_added`、`type_removed`）。
 
 ### 反例的可信度
 
@@ -117,7 +143,8 @@ pytest -q
 
 - `severity: error`：找到了经过验证的最小反例，确定破坏兼容；
 - `severity: warning`：启发式规则（如 `pattern` 变更、`multipleOf` 新增、
-  `anyOf` 新增）无法自动构造出经过验证的反例，标记为潜在风险供人工确认。
+  `anyOf` 新增）或条件分支（`if`/`then`/`else`）探测无法自动构造出经过
+  验证的反例，标记为潜在风险供人工确认。
 
 `path` 使用 JSON Pointer 风格定位到 schema 中出问题的关键字位置（如
 `#/properties/addresses/items`）；`counterexample_path` 定位反例文档中
@@ -554,6 +581,7 @@ curl -X POST http://localhost:8000/api/analyses/1/gate \
 | `min/max_length_*` / `pattern_changed` | 字符串长度、正则变化 |
 | `anyOf/oneOf_branch_missing` / `_added` / `_rejected` | 组合分支不兼容 |
 | `not_added` | 新增 not 否定约束 |
+| `condition_changed` | if 条件表达式变化，实例分支归属可能改变 |
 | `schema_forbids_all` | 目标位置为 `false`，拒绝所有实例 |
 | `sample_rejected_by_new/old` | 提供的真实样例被某一版拒绝 |
 
@@ -564,5 +592,6 @@ curl -X POST http://localhost:8000/api/analyses/1/gate \
 引擎核心是单向蕴含检查 `find_violations(source, target)`：递归找出所有
 "source 允许、target 拒绝"的结构，为每个结构生成一个位于该路径的最小片段，
 再沿 schema 路径反向包裹成完整文档（过程中自动补齐 `required`、数组前缀、
-`minItems` 等约束），最后用 `jsonschema` 双向验证。交换入参即可得到另一个
-兼容方向，所以所有规则只需实现一遍。
+`minItems` 等约束；`then` 分支还会补齐使命中 `if` 的字段以激活分支），
+最后用 `jsonschema` 双向验证。交换入参即可得到另一个兼容方向，
+所以所有规则只需实现一遍。

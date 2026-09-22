@@ -78,6 +78,7 @@ _RULE_DESCRIPTIONS: dict[str, str] = {
     "anyOf_branch_rejected": "原有实例不再满足新版 anyOf 的任一分支",
     "oneOf_branch_rejected": "原有实例不再满足新版 oneOf 的任一分支",
     "not_added": "新版新增 not 否定约束",
+    "condition_changed": "if 条件表达式发生变化，实例分支归属可能改变",
     "schema_forbids_all": "目标位置 schema 为 false，拒绝所有实例",
     "sample_rejected_by_new": "提供的样例文档被新版 schema 拒绝",
     "sample_rejected_by_old": "提供的样例文档被旧版 schema 拒绝",

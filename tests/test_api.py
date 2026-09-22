@@ -104,6 +104,49 @@ def test_compatible_schemas(client):
     assert report["summary"]["errors"] == 0
 
 
+def test_conditional_if_then_else_end_to_end(client):
+    """if/then/else 条件分支：分析 -> 报告 -> SARIF -> 门禁 全链路。"""
+    resp = client.post("/api/analyses", json={
+        "name": "conditional-case",
+        "old_schema": {
+            "if": {"required": ["kind"]},
+            "then": {"properties": {"x": {"type": "string"}}},
+        },
+        "new_schema": {
+            "if": {"required": ["kind"]},
+            "then": {"properties": {"x": {"type": "integer"}}},
+        },
+    })
+    assert resp.status_code == 201, resp.text
+    data = resp.json()
+    report = data["report"]
+    assert report["backward_compatible"] is False
+    then_issues = [i for i in report["issues"] if i["path"].startswith("#/then")]
+    assert then_issues
+    assert any(i["severity"] == "error" and i["counterexample"] is not None
+               for i in then_issues)
+    # 双向汇总结构保持
+    assert report["summary"]["backward"]["errors"] >= 1
+
+    analysis_id = data["id"]
+
+    # SARIF 可消费：条件分支 issue 出现在 results 与 logicalLocations 中
+    sarif = client.get(f"/api/analyses/{analysis_id}/sarif")
+    assert sarif.status_code == 200
+    run = sarif.json()["runs"][0]
+    locations = [loc["fullyQualifiedName"] for loc in run["logicalLocations"]]
+    assert "#/then/properties/x" in locations
+    assert any(r["ruleId"] == "type_removed" and r["level"] == "error"
+               for r in run["results"])
+
+    # 门禁可消费：未豁免 error 阻断发布
+    gate = client.post(f"/api/analyses/{analysis_id}/gate",
+                       json={"directions": ["backward"]})
+    assert gate.status_code == 200
+    assert gate.json()["pass"] is False
+    assert gate.json()["counts"]["backward"]["errors"] >= 1
+
+
 # ---------------------------------------------------------------------------
 # POST /api/analyses/compare
 # ---------------------------------------------------------------------------
