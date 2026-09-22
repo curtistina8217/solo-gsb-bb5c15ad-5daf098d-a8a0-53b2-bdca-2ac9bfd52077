@@ -1,7 +1,8 @@
 # JSON Schema 兼容性分析 API
 
 用 **FastAPI + SQLite** 构建的 JSON Schema 兼容性分析服务。提交旧版与新版 JSON Schema
-（以及可选的样例文档），服务会递归比较两者的**类型、必填字段、枚举、数组、对象和组合关键字**，
+（以及可选的样例文档），服务会递归比较两者的**类型、必填字段、枚举、数组、对象、
+组合关键字与 if/then/else 条件分支**，
 分别判断**向后兼容**与**向前兼容**，并为每一处破坏点生成**最小反例路径、反例文档和原因说明**。
 
 - Web 框架：FastAPI
@@ -25,7 +26,7 @@
 │   ├── models.py        # Analysis ORM 模型
 │   └── schemas.py       # Pydantic 请求 / 响应模型
 ├── tests/
-│   ├── test_compat.py   # 引擎单元测试（30+ 用例）
+│   ├── test_compat.py   # 引擎单元测试（含 if/then/else 条件分支用例）
 │   ├── test_compare.py  # 基线对比单元测试
 │   ├── test_gate.py     # 发布门禁单元测试
 │   └── test_api.py      # 接口端到端测试
@@ -108,7 +109,32 @@ pytest -q
   `exclusiveMinimum/Maximum` 数值写法、`multipleOf`
 - `minLength` / `maxLength`、`pattern`
 - 组合关键字：`allOf`（浅合并后比较）、`anyOf`、`oneOf`、`not`
+- 条件关键字：`if` / `then` / `else`（draft-07+，按实例命中情况分
+  激活单元比较，详见下文）
 - 文档内部 `$ref`（`#/$defs/...`，带环保护）
+
+### 条件分支（if / then / else，draft-07+）
+
+实例按是否命中 `if` 被路由到 `then` 或 `else`，因此引擎把每个条件节点
+拆成"**激活单元**"（源命中 / 未命中 × 目标命中 / 未命中）分别递归比较，
+属性内嵌套的更深层条件同样逐层处理：
+
+- 命中走 `then`、未命中走 `else`：同分支单元直接比较分支内容；
+- 新旧 `if` 条件不一致时，额外检查"源命中、目标未命中"（以及相反）的
+  跨分支路由单元，并在条件节点上按需**强制构造满足 / 违反 `if` 的实例**
+  （鉴别器属性合并、节点枚举内取值替换、required 属性移除等）来激活
+  对应分支；
+- 仅一侧有条件时，另一侧整体参与比较。
+
+判定与反例规则：
+
+- 只有构造出的文档**经验证满足源 schema 且被目标 schema 拒绝**时才记
+  `error` 并附最小反例；无法自动验证时降级为 `warning`；
+- **未激活的分支不会单独被判为破坏**（如 `if` 永假时 `then` 的差异只
+  产生 warning）；
+- `issue.path` 定位到发生变化的条件或分支：`#/if`（条件表达式变化，
+  code `if_condition_changed`）、`#/then/...`、`#/else/...`（分支内部
+  变化，沿用 `required_added`、`enum_value_removed` 等既有 code）。
 
 ### 反例的可信度
 
@@ -117,7 +143,8 @@ pytest -q
 
 - `severity: error`：找到了经过验证的最小反例，确定破坏兼容；
 - `severity: warning`：启发式规则（如 `pattern` 变更、`multipleOf` 新增、
-  `anyOf` 新增）无法自动构造出经过验证的反例，标记为潜在风险供人工确认。
+  `anyOf` 新增）或条件分支中无法自动构造出经过验证的反例，标记为潜在
+  风险供人工确认。
 
 `path` 使用 JSON Pointer 风格定位到 schema 中出问题的关键字位置（如
 `#/properties/addresses/items`）；`counterexample_path` 定位反例文档中
@@ -554,6 +581,7 @@ curl -X POST http://localhost:8000/api/analyses/1/gate \
 | `min/max_length_*` / `pattern_changed` | 字符串长度、正则变化 |
 | `anyOf/oneOf_branch_missing` / `_added` / `_rejected` | 组合分支不兼容 |
 | `not_added` | 新增 not 否定约束 |
+| `if_condition_changed` | if 条件表达式变化，实例可能被路由到不同 then/else 分支 |
 | `schema_forbids_all` | 目标位置为 `false`，拒绝所有实例 |
 | `sample_rejected_by_new/old` | 提供的真实样例被某一版拒绝 |
 
@@ -566,3 +594,8 @@ curl -X POST http://localhost:8000/api/analyses/1/gate \
 再沿 schema 路径反向包裹成完整文档（过程中自动补齐 `required`、数组前缀、
 `minItems` 等约束），最后用 `jsonschema` 双向验证。交换入参即可得到另一个
 兼容方向，所以所有规则只需实现一遍。
+
+遇到 `if` / `then` / `else` 条件节点时，引擎在源 schema 的副本上把该节点
+替换为"rest + 激活分支"的构造用 schema，按激活单元派生子比较；子比较
+构造反例时会按需强制实例满足 / 违反对应的 `if`，并启用验证门禁——
+只有经验证的反例才记 `error`，否则统一降级 `warning`。

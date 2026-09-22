@@ -251,3 +251,17 @@ def test_sarif_does_not_modify_report(client):
     assert resp.status_code == 200
     after = client.get(f"/api/analyses/{analysis['id']}").json()
     assert after["report"] == analysis["report"]
+
+
+def test_if_condition_changed_rule_description():
+    doc = build_sarif(_analysis([
+        _issue(code="if_condition_changed", path="#/if", severity="warning",
+               message="新版 if 条件发生变化"),
+    ]))
+    rules = doc["runs"][0]["tool"]["driver"]["rules"]
+    assert [r["id"] for r in rules] == ["if_condition_changed"]
+    assert rules[0]["shortDescription"]["text"]
+    # 条件路径作为逻辑位置导出
+    locations = doc["runs"][0]["logicalLocations"]
+    assert [loc["fullyQualifiedName"] for loc in locations] == ["#/if"]
+    assert locations[0]["name"] == "if"

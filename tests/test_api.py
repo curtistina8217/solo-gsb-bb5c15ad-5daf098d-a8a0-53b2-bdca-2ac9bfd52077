@@ -104,6 +104,31 @@ def test_compatible_schemas(client):
     assert report["summary"]["errors"] == 0
 
 
+def test_conditional_if_then_else_end_to_end(client):
+    """draft-07+ 条件分支：then 收紧 -> 向后破坏，issue 定位到 #/then。"""
+    if_a = {"required": ["kind"], "properties": {"kind": {"const": "a"}}}
+    old = {"type": "object",
+           "properties": {"kind": {"enum": ["a", "b"]}},
+           "required": ["kind"],
+           "if": if_a, "then": {"required": ["x"]}}
+    new = {"type": "object",
+           "properties": {"kind": {"enum": ["a", "b"]}},
+           "required": ["kind"],
+           "if": if_a, "then": {"required": ["x", "y"]}}
+    resp = client.post("/api/analyses", json={
+        "name": "conditional", "old_schema": old, "new_schema": new,
+    })
+    assert resp.status_code == 201, resp.text
+    report = resp.json()["report"]
+    assert report["backward_compatible"] is False
+    assert report["forward_compatible"] is True
+    issue = [i for i in report["issues"] if i["direction"] == "backward"][0]
+    assert issue["code"] == "required_added"
+    assert issue["path"] == "#/then"
+    assert issue["severity"] == "error"
+    assert issue["counterexample"]["kind"] == "a"
+
+
 # ---------------------------------------------------------------------------
 # POST /api/analyses/compare
 # ---------------------------------------------------------------------------

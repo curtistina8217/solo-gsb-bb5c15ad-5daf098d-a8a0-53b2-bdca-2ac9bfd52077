@@ -14,6 +14,12 @@
 "source 允许但 target 拒绝" 的情况构造最小反例，再交换入参即可得到
 另一方向。
 
+条件分支（draft-07+ 的 if / then / else）按实例是否命中 if 拆成
+"激活单元"（源命中 / 未命中 × 目标命中 / 未命中）分别递归比较，
+构造反例时按需强制实例满足 / 违反对应的 if 来激活目标分支；
+只有构造出的文档经验证满足源 schema 且被目标 schema 拒绝时才记
+error，否则降级为 warning —— 未激活的分支不会单独被判为破坏。
+
 反例会用 ``jsonschema`` 做一次最终校验（source 合法且 target 拒绝），
 保证返回的 counterexample 真实有效；启发式检查（pattern、multipleOf、
 anyOf 覆盖等）若无法构造出经过验证的反例，则降级为 warning。
@@ -327,6 +333,8 @@ def typed_fragment(schema: Any, json_type: str) -> Any:
 # ("pp", pattern)      patternProperties/<pattern>
 # ("kw", kw, i)        anyOf/oneOf/allOf 第 i 个分支（透明，不产生嵌套）
 # ("not",)             not（透明）
+# ("then",)/("else",)/("if",)
+#                      条件分支（透明，不产生文档嵌套；嵌入时按节点整体约束补齐实例）
 
 def render_path(path: tuple) -> str:
     parts: list[str] = []
@@ -348,6 +356,8 @@ def render_path(path: tuple) -> str:
             parts += [frame[1], str(frame[2])]
         elif kind == "not":
             parts.append("not")
+        elif kind in ("then", "else", "if"):
+            parts.append(kind)
     return "#/" + "/".join(escape_pointer(p) for p in parts) if parts else "#"
 
 
@@ -356,29 +366,40 @@ def escape_pointer(token: str) -> str:
 
 
 def walk_schema(root: Any, path: tuple) -> tuple[Any, list]:
-    """沿路径走到 source schema，返回 (终点 schema, [(frame, 进入前 schema)])。"""
+    """沿路径走到 source schema，返回 (终点 schema, [(frame, 进入前 schema)])。
+
+    中间节点不是 dict（如 true）时按无约束继续导航，保证条件分支等
+    场景化 embed root 上的路径总能走通。
+    """
     schema = effective(root)
     stack: list[tuple] = []
     for frame in path:
         kind = frame[0]
         stack.append((frame, schema))
-        if kind == "p":
-            schema = schema.get("properties", {}).get(frame[1], True)
-        elif kind == "items":
-            _, rest, _ = normalize_items(schema)
-            schema = rest
-        elif kind == "tup":
-            i = frame[1]
-            prefix, rest, _ = normalize_items(schema)
-            schema = prefix[i] if prefix and i < len(prefix) else rest
-        elif kind in ("ap", "apn"):
-            schema = schema.get("additionalProperties", True)
-        elif kind == "pp":
-            schema = schema.get("patternProperties", {}).get(frame[1], True)
-        elif kind == "kw":
-            schema = schema.get(frame[1], [True])[frame[2]]
-        elif kind == "not":
-            schema = schema.get("not", True)
+        if isinstance(schema, dict):
+            if kind == "p":
+                schema = schema.get("properties", {}).get(frame[1], True)
+            elif kind == "items":
+                _, rest, _ = normalize_items(schema)
+                schema = rest
+            elif kind == "tup":
+                i = frame[1]
+                prefix, rest, _ = normalize_items(schema)
+                schema = prefix[i] if prefix and i < len(prefix) else rest
+            elif kind in ("ap", "apn"):
+                schema = schema.get("additionalProperties", True)
+            elif kind == "pp":
+                schema = schema.get("patternProperties", {}).get(frame[1], True)
+            elif kind == "kw":
+                schema = schema.get(frame[1], [True])[frame[2]]
+            elif kind == "not":
+                schema = schema.get("not", True)
+            elif kind in ("then", "else", "if"):
+                schema = schema.get(kind, True)
+            else:
+                schema = True
+        else:
+            schema = True
         schema = effective(schema)
     return schema, stack
 
@@ -417,6 +438,14 @@ def embed_fragment(root: Any, path: tuple, fragment: Any) -> tuple[Any, str]:
         kind = frame[0]
         if kind in ("kw", "not"):
             continue  # 组合关键字不引入新的文档层级
+        if kind in ("then", "else", "if"):
+            # 条件分支帧同样不引入文档层级，但实例需满足所在节点的整体约束：
+            # 用节点（rest + 分支合并后的构造 schema）的最小实例补齐缺失字段
+            if isinstance(before, dict) and isinstance(value, dict):
+                filled = minimal_object(before)
+                filled.update(value)
+                value = filled
+            continue
         if kind == "p":
             obj = minimal_object(before if isinstance(before, dict) else {})
             obj[frame[1]] = value
@@ -506,6 +535,10 @@ def collect_tuple_keywords(root: Any) -> dict[str, str]:
         for kw in ("anyOf", "oneOf", "allOf"):
             for sub in schema.get(kw, []) or []:
                 walk(sub, tup_prefix)
+        for key in ("if", "then", "else"):
+            sub = schema.get(key)
+            if isinstance(sub, dict):
+                walk(sub, tup_prefix)
 
     def _strip_tail(tup_prefix: str) -> str:
         # 进入齐次 items 时，tup 前缀语义结束；保留外层路径即可
@@ -547,17 +580,32 @@ HEURISTIC_SUFFIX = "（未能自动构造出经过验证的反例，标记为潜
 
 
 class IssueBuilder:
-    def __init__(self, source_root: Any, target_root: Any, source_validator, target_validator):
+    def __init__(self, source_root: Any, target_root: Any, source_validator, target_validator,
+                 embed_prefix: tuple = (), force_specs: list | tuple = (),
+                 verified_only: bool = False):
         self.source_root = source_root
         self.target_root = target_root
         self.source_validator = source_validator
         self.target_validator = target_validator
+        # 条件分支单元专用：
+        # * embed_prefix —— 路径前缀（含 then/else/if 帧），子分析在场景化
+        #   embed root 上以相对路径工作，渲染与嵌入时统一补上该前缀；
+        # * force_specs —— (绝对路径, if schema, 是否命中, 源节点 schema)，
+        #   构造反例时按需强制实例满足 / 违反对应的 if 条件；
+        # * verified_only —— 只有经验证的反例才记 error，否则降级 warning。
+        self.embed_prefix = embed_prefix
+        self.force_specs = list(force_specs)
+        self.verified_only = verified_only
         self.tuple_keywords = collect_tuple_keywords(source_root)
         self.raw: list[dict] = []
 
     def _render(self, path: tuple) -> str:
         rendered = render_path(path)
         return resolve_tuple_placeholders(rendered, self.tuple_keywords)
+
+    def embed(self, path: tuple, fragment: Any) -> tuple[Any, str]:
+        """把位于（相对）path 的片段向上包裹成完整文档。"""
+        return embed_fragment(self.source_root, self.embed_prefix + path, fragment)
 
     def verified_witness(self, candidate: Any) -> bool:
         try:
@@ -567,6 +615,48 @@ class IssueBuilder:
         except (RecursionError, Exception):  # noqa: BLE001
             return False
 
+    def _with_forced_activation(self, doc: Any) -> list:
+        """按 force_specs 生成强制满足 / 违反各级 if 条件的文档变体。"""
+        variants = [doc]
+        for abs_path, if_schema, want, node_schema in self.force_specs:
+            try:
+                _, pointer = embed_fragment(self.source_root, abs_path, None)
+            except Exception:  # noqa: BLE001
+                continue
+            expanded: list = []
+            for variant in variants:
+                expanded.extend(_activation_variants(variant, pointer, if_schema,
+                                                     want, node_schema))
+            variants.extend(expanded)
+            if len(variants) > 24:
+                break
+        return variants[:24]
+
+    def _add_conditional(self, full_path: tuple, code: str, message: str, reason: str,
+                         fragment: Any = _MISSING, candidate: Any = _MISSING) -> None:
+        """条件分支单元专用：只有经验证的反例才记 error，否则降级 warning。"""
+        pointer = "#"
+        candidates: list = []
+        if candidate is not _MISSING:
+            candidates = self._with_forced_activation(candidate)
+        elif fragment is not _MISSING:
+            doc, pointer = embed_fragment(self.source_root, full_path, fragment)
+            candidates = self._with_forced_activation(doc)
+        for doc in candidates:
+            if self.verified_witness(doc):
+                self.raw.append({
+                    "path": self._render(full_path), "code": code, "severity": "error",
+                    "message": message, "reason": reason,
+                    "counterexample": doc, "counterexample_path": pointer,
+                })
+                return
+        self.raw.append({
+            "path": self._render(full_path), "code": code, "severity": "warning",
+            "message": message,
+            "reason": reason + HEURISTIC_SUFFIX,
+            "counterexample": None, "counterexample_path": None,
+        })
+
     def add(self, path: tuple, code: str, message: str, reason: str,
             fragment: Any = None, heuristic: bool = False,
             candidate: Any = _MISSING) -> None:
@@ -574,18 +664,26 @@ class IssueBuilder:
 
         * 普通问题：fragment 是位于 path 的违规片段，自动包裹成完整文档并校验；
         * 启发式问题（heuristic=True）：candidate 是完整文档，经验证成立才算
-          error，否则降级为 warning 且不附反例。
+          error，否则降级为 warning 且不附反例；
+        * 条件分支单元（verified_only=True）：所有问题都按验证门禁处理——
+          嵌入片段后按需强制激活对应 if 分支，只有构造出的文档经验证
+          满足源 schema 且被目标 schema 拒绝时才记 error，否则降级 warning。
         """
+        full_path = self.embed_prefix + path
+        if self.verified_only:
+            self._add_conditional(full_path, code, message, reason,
+                                  fragment=fragment, candidate=candidate)
+            return
         if heuristic:
             if candidate is not _MISSING and self.verified_witness(candidate):
                 self.raw.append({
-                    "path": self._render(path), "code": code, "severity": "error",
+                    "path": self._render(full_path), "code": code, "severity": "error",
                     "message": message, "reason": reason,
                     "counterexample": candidate, "counterexample_path": "#",
                 })
             else:
                 self.raw.append({
-                    "path": self._render(path), "code": code, "severity": "warning",
+                    "path": self._render(full_path), "code": code, "severity": "warning",
                     "message": message,
                     "reason": reason + HEURISTIC_SUFFIX,
                     "counterexample": None, "counterexample_path": None,
@@ -595,7 +693,7 @@ class IssueBuilder:
         counterexample = None
         counterexample_path = None
         if fragment is not _MISSING:
-            doc, pointer = embed_fragment(self.source_root, path, fragment)
+            doc, pointer = embed_fragment(self.source_root, full_path, fragment)
             if self.verified_witness(doc):
                 counterexample, counterexample_path = doc, pointer
             else:
@@ -603,7 +701,7 @@ class IssueBuilder:
                 # 保留问题但不附可能误导的反例。
                 pass
         self.raw.append({
-            "path": self._render(path), "code": code, "severity": "error",
+            "path": self._render(full_path), "code": code, "severity": "error",
             "message": message, "reason": reason,
             "counterexample": counterexample,
             "counterexample_path": counterexample_path,
@@ -683,7 +781,8 @@ def _uses_legacy_dialect(schema: Any, seen: frozenset[int]) -> bool:
         if isinstance(section, dict):
             if any(_uses_legacy_dialect(sub, seen) for sub in section.values() if isinstance(sub, dict)):
                 return True
-    for key in ("items", "additionalProperties", "not", "additionalItems", "contains"):
+    for key in ("items", "additionalProperties", "not", "additionalItems", "contains",
+                "if", "then", "else"):
         sub = schema.get(key)
         if isinstance(sub, dict) and _uses_legacy_dialect(sub, seen):
             return True
@@ -759,6 +858,10 @@ def _check(old: Any, new: Any, path: tuple, builder: IssueBuilder,
     # ---- 组合关键字 anyOf / oneOf / not -----------------------------------
     _check_composition(old, new, path, builder, source_validator, target_validator)
 
+    # ---- 条件关键字 if / then / else（draft-07+）---------------------------
+    _check_conditional(old, new, path, builder, source_root, target_root,
+                       source_validator, target_validator)
+
 
 def _check_enum_const(old: dict, new: dict, path: tuple, builder: IssueBuilder) -> None:
     if isinstance(new.get("enum"), list):
@@ -791,7 +894,7 @@ def _check_enum_const(old: dict, new: dict, path: tuple, builder: IssueBuilder) 
                     value = None
                 if member_of_enum(value, new_enum):
                     continue
-                doc, _ = embed_fragment(builder.source_root, path, value)
+                doc, _ = builder.embed(path, value)
                 if builder.verified_witness(doc):
                     builder.add(path, "enum_added",
                                 "新版新增了枚举约束，旧版允许的部分取值会被拒绝",
@@ -822,7 +925,7 @@ def _check_enum_const(old: dict, new: dict, path: tuple, builder: IssueBuilder) 
             for value in candidates:
                 if value == const_value:
                     continue
-                doc, _ = embed_fragment(builder.source_root, path, value)
+                doc, _ = builder.embed(path, value)
                 if builder.verified_witness(doc):
                     builder.add(path, "const_added",
                                 f"新版要求常量 {jsonish(const_value)}",
@@ -868,7 +971,7 @@ def _check_types(old: dict, new: dict, path: tuple, builder: IssueBuilder,
             if candidate_type in new_types:
                 continue
             fragment = typed_fragment(old, candidate_type)
-            doc, _ = embed_fragment(builder.source_root, path, fragment)
+            doc, _ = builder.embed(path, fragment)
             if builder.verified_witness(doc):
                 builder.add(path, "type_restricted",
                             f"新版将类型限制为 {sorted(new_types)}，旧版允许任意类型",
@@ -988,7 +1091,7 @@ def _check_object(old: dict, new: dict, path: tuple, builder: IssueBuilder,
         target_size = max(new_max + 1, old_min)
         while len(fragment) < target_size:
             fragment[extra_key(old, fragment)] = 1
-        doc, _ = embed_fragment(builder.source_root, path, fragment)
+        doc, _ = builder.embed(path, fragment)
         if builder.verified_witness(doc):
             builder.add(path, "max_properties_decreased",
                         f"新版最多允许 {new_max} 个属性（旧版 {old_max}）",
@@ -1057,7 +1160,7 @@ def _check_array(old: dict, new: dict, path: tuple, builder: IssueBuilder) -> No
                 fragment.append(minimal_instance(prefix[j]))
             else:
                 fragment.append(minimal_instance(rest))
-        doc, _ = embed_fragment(builder.source_root, path, fragment)
+        doc, _ = builder.embed(path, fragment)
         if builder.verified_witness(doc):
             builder.add(path, "max_items_decreased",
                         f"新版数组最多允许 {new_max} 个元素（旧版 {old_max}）",
@@ -1070,7 +1173,7 @@ def _check_array(old: dict, new: dict, path: tuple, builder: IssueBuilder) -> No
         element_schema = prefix[0] if prefix else rest
         value = minimal_instance(element_schema)
         candidate = [copy.deepcopy(value), copy.deepcopy(value)]
-        doc, _ = embed_fragment(builder.source_root, path, candidate)
+        doc, _ = builder.embed(path, candidate)
         if builder.verified_witness(doc):
             builder.add(path, "unique_items_added",
                         "新版要求数组元素唯一（uniqueItems）",
@@ -1097,7 +1200,7 @@ def _check_number(old: dict, new: dict, path: tuple, builder: IssueBuilder) -> N
         else:
             candidate = None
         if candidate is not None:
-            doc, _ = embed_fragment(builder.source_root, path, candidate)
+            doc, _ = builder.embed(path, candidate)
             if builder.verified_witness(doc):
                 builder.add(path, "minimum_increased",
                             f"新版下界收紧为 {fmt_bound(new_lo, new_lo_ex)}",
@@ -1115,7 +1218,7 @@ def _check_number(old: dict, new: dict, path: tuple, builder: IssueBuilder) -> N
         else:
             candidate = None
         if candidate is not None:
-            doc, _ = embed_fragment(builder.source_root, path, candidate)
+            doc, _ = builder.embed(path, candidate)
             if builder.verified_witness(doc):
                 builder.add(path, "maximum_decreased",
                             f"新版上界收紧为 {fmt_bound(new_hi, new_hi_ex)}",
@@ -1124,7 +1227,7 @@ def _check_number(old: dict, new: dict, path: tuple, builder: IssueBuilder) -> N
 
     # ---- 新增整数约束 / multipleOf（启发式）--------------------------------
     if type_set(old) is None and type_set(new) and "integer" in type_set(new):
-        doc, _ = embed_fragment(builder.source_root, path, 1.5)
+        doc, _ = builder.embed(path, 1.5)
         builder.add(path, "integer_required",
                     "新版要求 integer，旧版允许小数",
                     "旧版未限制为整数，小数值在新版会被拒绝",
@@ -1134,7 +1237,7 @@ def _check_number(old: dict, new: dict, path: tuple, builder: IssueBuilder) -> N
         step = new["multipleOf"]
         probe_values = [0.5, 1.5, 0.1, step / 2 if isinstance(step, (int, float)) else 0.5]
         for value in probe_values:
-            doc, _ = embed_fragment(builder.source_root, path, value)
+            doc, _ = builder.embed(path, value)
             if builder.verified_witness(doc):
                 builder.add(path, "multiple_of_added",
                             f"新版要求数值是 {step} 的整数倍",
@@ -1167,7 +1270,7 @@ def _check_string(old: dict, new: dict, path: tuple, builder: IssueBuilder) -> N
     new_min = new.get("minLength", 0) or 0
     if new_min > old_min:
         fragment = "a" * max(new_min - 1, old_min)
-        doc, _ = embed_fragment(builder.source_root, path, fragment)
+        doc, _ = builder.embed(path, fragment)
         if builder.verified_witness(doc):
             builder.add(path, "min_length_increased",
                         f"新版要求字符串最短 {new_min}（旧版 {old_min}）",
@@ -1177,7 +1280,7 @@ def _check_string(old: dict, new: dict, path: tuple, builder: IssueBuilder) -> N
     new_max = new.get("maxLength")
     if new_max is not None and (old_max is None or new_max < old_max):
         fragment = "a" * max(new_max + 1, old_min)
-        doc, _ = embed_fragment(builder.source_root, path, fragment)
+        doc, _ = builder.embed(path, fragment)
         if builder.verified_witness(doc):
             builder.add(path, "max_length_decreased",
                         f"新版字符串最长 {new_max}（旧版 {old_max}）",
@@ -1204,7 +1307,7 @@ def _check_composition(old: dict, new: dict, path: tuple, builder: IssueBuilder,
                     probes.append(minimal_instance(branch))
         hit = False
         for candidate in probes:
-            doc, _ = embed_fragment(builder.source_root, path, candidate)
+            doc, _ = builder.embed(path, candidate)
             if builder.verified_witness(doc):
                 builder.add(path, f"{keyword}_branch_missing",
                             f"新版 {keyword} 没有任何分支能接受该旧版实例",
@@ -1226,7 +1329,7 @@ def _check_composition(old: dict, new: dict, path: tuple, builder: IssueBuilder,
             if not is_schema(branch):
                 continue
             candidate = minimal_instance(branch)
-            doc, _ = embed_fragment(builder.source_root, path, candidate)
+            doc, _ = builder.embed(path, candidate)
             if builder.verified_witness(doc):
                 builder.add(path, f"{keyword}_branch_rejected",
                             f"旧版 {keyword} 第 {i} 个分支允许的实例被新版拒绝",
@@ -1237,7 +1340,7 @@ def _check_composition(old: dict, new: dict, path: tuple, builder: IssueBuilder,
     # ---- 新版新增 not ------------------------------------------------------
     if is_schema(new.get("not")) and new.get("not") != old.get("not"):
         candidate = minimal_instance(new["not"])  # 满足 not 内层 -> 必被 not 拒绝
-        doc, _ = embed_fragment(builder.source_root, path, candidate)
+        doc, _ = builder.embed(path, candidate)
         if builder.verified_witness(doc):
             builder.add(path, "not_added",
                         "新版新增 not 约束，旧版允许的部分实例被明确禁止",
@@ -1248,6 +1351,449 @@ def _check_composition(old: dict, new: dict, path: tuple, builder: IssueBuilder,
                         "新版新增 not 约束",
                         "旧版部分实例可能命中新版 not 而被拒绝",
                         heuristic=True, candidate=minimal_instance(old))
+
+
+# ---------------------------------------------------------------------------
+# 条件分支 if / then / else（draft-07+）
+# ---------------------------------------------------------------------------
+#
+# 实例按是否命中 if 被路由到 then 或 else，因此不能只看分支字面做比较，
+# 必须按"源实例命中旧 if × 目标实例命中新 if"的组合（激活单元）分别检查：
+#
+# * 命中 -> then、未命中 -> else：同分支单元直接比较分支内容；
+# * 源命中、目标未命中（或相反）：只有新旧 if 条件不同才可能出现，
+#   比较源 then 与目标 else（或源 else 与目标 then）；
+# * 仅一侧有条件：另一侧整体参与比较。
+#
+# 每个激活单元在源 schema 的副本上把条件节点替换为"rest + 激活分支"的
+# 构造用 schema 再递归比较；构造反例时按需强制实例满足 / 违反对应的
+# if（激活强制）。只有构造出的文档经验证满足源 schema 且被目标 schema
+# 拒绝时才记 error，否则降级为 warning —— 未激活的分支不会单独被判为
+# 破坏。
+
+
+def _has_conditional(schema: Any) -> bool:
+    """schema 是否带有实际生效的条件分支（if 与 then/else 同时存在）。"""
+    return isinstance(schema, dict) and "if" in schema and ("then" in schema or "else" in schema)
+
+
+def _strip_conditional(schema: Any) -> Any:
+    """去掉节点自身的 if / then / else 键。
+
+    单侧条件的激活单元用 rest + 分支的合并结果做比较时，必须摘掉节点
+    自身的条件键，否则子分析会重复进入同一个条件节点导致无限递归；
+    分支内容里更深层嵌套的条件不受影响。
+    """
+    if not isinstance(schema, dict):
+        return schema
+    return {k: v for k, v in schema.items() if k not in ("if", "then", "else")}
+
+
+def _navigate_frame(schema: Any, frame: tuple) -> Any:
+    """沿单个路径帧前进一步（与 walk_schema 的单步语义一致，不合并 allOf）。"""
+    if not isinstance(schema, dict):
+        return None
+    kind = frame[0]
+    if kind == "p":
+        return schema.get("properties", {}).get(frame[1])
+    if kind == "items":
+        _, rest, _ = normalize_items(schema)
+        return rest
+    if kind == "tup":
+        prefix, rest, _ = normalize_items(schema)
+        i = frame[1]
+        return prefix[i] if prefix and i < len(prefix) else rest
+    if kind in ("ap", "apn"):
+        return schema.get("additionalProperties")
+    if kind == "pp":
+        return schema.get("patternProperties", {}).get(frame[1])
+    if kind == "kw":
+        branches = schema.get(frame[1])
+        if isinstance(branches, list) and frame[2] < len(branches):
+            return branches[frame[2]]
+        return None
+    if kind == "not":
+        return schema.get("not")
+    if kind in ("if", "then", "else"):
+        return schema.get(kind)
+    return None
+
+
+def _replace_at_path(root: Any, path: tuple, replacement: Any) -> Any:
+    """返回把 path 处子 schema 替换为 replacement 后的新 schema（不修改入参）。
+
+    路径无法导航（如中间节点要经 allOf 合并才存在）时返回未替换的副本，
+    调用方退化为在原 schema 上构造，最终由反例校验兜底。
+    """
+    if not path:
+        return copy.deepcopy(replacement)
+    new_root = copy.deepcopy(root)
+    node = new_root
+    for frame in path[:-1]:
+        node = _navigate_frame(node, frame)
+        if node is None:
+            return new_root
+    if not isinstance(node, dict):
+        return new_root
+    frame = path[-1]
+    kind = frame[0]
+    if kind == "p":
+        node.setdefault("properties", {})[frame[1]] = copy.deepcopy(replacement)
+    elif kind == "items":
+        if "prefixItems" in node or not isinstance(node.get("items"), list):
+            node["items"] = copy.deepcopy(replacement)
+        else:
+            node["additionalItems"] = copy.deepcopy(replacement)
+    elif kind == "tup":
+        i = frame[1]
+        prefix, _, _ = normalize_items(node)
+        if "prefixItems" in node:
+            if prefix is not None and i < len(prefix):
+                node["prefixItems"][i] = copy.deepcopy(replacement)
+            else:
+                node["items"] = copy.deepcopy(replacement)
+        elif isinstance(node.get("items"), list):
+            if prefix is not None and i < len(prefix):
+                node["items"][i] = copy.deepcopy(replacement)
+            else:
+                node["additionalItems"] = copy.deepcopy(replacement)
+        else:
+            node["items"] = copy.deepcopy(replacement)
+    elif kind in ("ap", "apn"):
+        node["additionalProperties"] = copy.deepcopy(replacement)
+    elif kind == "pp":
+        node.setdefault("patternProperties", {})[frame[1]] = copy.deepcopy(replacement)
+    elif kind == "kw":
+        branches = node.get(frame[1])
+        if isinstance(branches, list) and frame[2] < len(branches):
+            branches[frame[2]] = copy.deepcopy(replacement)
+    elif kind == "not":
+        node["not"] = copy.deepcopy(replacement)
+    elif kind in ("if", "then", "else"):
+        node[kind] = copy.deepcopy(replacement)
+    return new_root
+
+
+def _instance_at_pointer(doc: Any, pointer: str) -> tuple[Any, bool]:
+    """按 JSON Pointer 取文档内的实例，返回 (实例, 是否找到)。"""
+    if pointer in ("#", ""):
+        return doc, True
+    node = doc
+    for seg in pointer[2:].split("/"):
+        seg = seg.replace("~1", "/").replace("~0", "~")
+        if isinstance(node, dict) and seg in node:
+            node = node[seg]
+        elif isinstance(node, list) and seg.isdigit() and int(seg) < len(node):
+            node = node[int(seg)]
+        else:
+            return None, False
+    return node, True
+
+
+def _replace_doc_at_pointer(doc: Any, pointer: str, value: Any) -> Any:
+    """返回把 pointer 处实例替换为 value 后的新文档（不修改入参）。"""
+    if pointer in ("#", ""):
+        return copy.deepcopy(value)
+    new_doc = copy.deepcopy(doc)
+    node = new_doc
+    segs = [seg.replace("~1", "/").replace("~0", "~") for seg in pointer[2:].split("/")]
+    for seg in segs[:-1]:
+        node = node[int(seg)] if isinstance(node, list) else node[seg]
+    last = segs[-1]
+    if isinstance(node, list):
+        node[int(last)] = copy.deepcopy(value)
+    else:
+        node[last] = copy.deepcopy(value)
+    return new_doc
+
+
+def _discriminator_values(if_schema: Any) -> dict:
+    """提取 if 条件中的鉴别器取值：required 且带 const / 单值 enum 的属性。"""
+    values: dict[str, Any] = {}
+    if not isinstance(if_schema, dict):
+        return values
+    props = if_schema.get("properties") or {}
+    for name in if_schema.get("required") or []:
+        sub = props.get(name)
+        if not isinstance(sub, dict):
+            continue
+        if "const" in sub:
+            values[name] = sub["const"]
+        elif isinstance(sub.get("enum"), list) and len(sub["enum"]) == 1:
+            values[name] = sub["enum"][0]
+    return values
+
+
+def _alternative_values(if_schema: Any, node_schema: Any) -> list:
+    """从节点自身 schema 的枚举里挑能违反 if 条件 const/enum 约束的取值。
+
+    用于"强制未命中 if"：替换后的值仍在节点自身约束（如枚举）之内，
+    保证文档对源 schema 其余部分依然合法。
+    """
+    out: list[tuple[str, Any]] = []
+    if not isinstance(node_schema, dict) or not isinstance(if_schema, dict):
+        return out
+    node_props = node_schema.get("properties") or {}
+    for name, sub in (if_schema.get("properties") or {}).items():
+        if not isinstance(sub, dict):
+            continue
+        if "const" in sub:
+            violates = lambda v: v != sub["const"]  # noqa: E731
+        elif isinstance(sub.get("enum"), list) and sub["enum"]:
+            violates = lambda v: not member_of_enum(v, sub["enum"])  # noqa: E731
+        else:
+            continue
+        node_sub = node_props.get(name)
+        pool = node_sub.get("enum") if isinstance(node_sub, dict) else None
+        if isinstance(pool, list):
+            for value in pool:
+                if violates(value):
+                    out.append((name, value))
+    return out
+
+
+def _if_probe_values(if_schema: Any, satisfy: bool) -> list:
+    """生成满足 / 违反 if 条件的候选实例（有界，尽力而为）。"""
+    if if_schema is True:
+        return [{}] if satisfy else []
+    if if_schema is False:
+        return [] if satisfy else [{}]
+    if not isinstance(if_schema, dict):
+        return []
+    try:
+        validator = make_validator(if_schema)
+    except Exception:  # noqa: BLE001
+        return []
+    if satisfy:
+        candidate = minimal_instance(if_schema)
+        try:
+            return [candidate] if validator.is_valid(candidate) else []
+        except Exception:  # noqa: BLE001
+            return []
+    candidates: list = []
+    base = minimal_instance(if_schema)
+    # 缺少 required 属性
+    for name in if_schema.get("required") or []:
+        if isinstance(base, dict) and name in base:
+            candidates.append({k: v for k, v in base.items() if k != name})
+    # const / enum 属性赋错误值
+    for name, sub in (if_schema.get("properties") or {}).items():
+        if not isinstance(sub, dict):
+            continue
+        wrong = _MISSING
+        if "const" in sub:
+            wrong = "__mismatch__" if sub["const"] != "__mismatch__" else None
+        elif isinstance(sub.get("enum"), list) and sub["enum"]:
+            wrong = next((v for v in ("__mismatch__", 0, None, True)
+                          if not member_of_enum(v, sub["enum"])), _MISSING)
+        if wrong is not _MISSING:
+            broken = copy.deepcopy(base) if isinstance(base, dict) else {}
+            broken[name] = wrong
+            candidates.append(broken)
+    # 类型不符
+    ts = type_set(if_schema)
+    if ts:
+        for candidate_type in PRIMITIVE_TYPES:
+            if candidate_type not in ts and not (candidate_type == "number" and "integer" in ts):
+                candidates.append(typed_fragment(if_schema, candidate_type))
+                break
+    candidates.extend([None, True, 0, "", [], {}])
+    out: list = []
+    for candidate in candidates:
+        try:
+            if not validator.is_valid(candidate):
+                out.append(candidate)
+        except Exception:  # noqa: BLE001
+            continue
+        if len(out) >= 4:
+            break
+    return out
+
+
+def _activation_variants(doc: Any, pointer: str, if_schema: Any, want: bool,
+                         node_schema: Any = None) -> list:
+    """生成把 pointer 处实例调整为满足 / 违反 if 条件的文档变体（有界）。"""
+    node, ok = _instance_at_pointer(doc, pointer)
+    if not ok:
+        return []
+    variants: list = []
+    if isinstance(node, dict) and isinstance(if_schema, dict):
+        if want:
+            # 鉴别器合并：保留节点其它字段，仅补齐判别属性取值
+            for name, value in _discriminator_values(if_schema).items():
+                merged = copy.deepcopy(node)
+                merged[name] = copy.deepcopy(value)
+                variants.append(_replace_doc_at_pointer(doc, pointer, merged))
+        else:
+            # 删除 if 的 required 属性使其不命中
+            for name in if_schema.get("required") or []:
+                if name in node:
+                    broken = {k: v for k, v in node.items() if k != name}
+                    variants.append(_replace_doc_at_pointer(doc, pointer, broken))
+            # 用节点自身枚举内的其它取值违反 if 的 const / enum
+            for name, alt in _alternative_values(if_schema, node_schema):
+                merged = copy.deepcopy(node)
+                merged[name] = copy.deepcopy(alt)
+                variants.append(_replace_doc_at_pointer(doc, pointer, merged))
+    for value in _if_probe_values(if_schema, satisfy=want)[:3]:
+        if isinstance(node, dict) and isinstance(value, dict):
+            merged = copy.deepcopy(node)
+            merged.update(value)
+            variants.append(_replace_doc_at_pointer(doc, pointer, merged))
+        variants.append(_replace_doc_at_pointer(doc, pointer, value))
+    return variants
+
+
+def _check_conditional(old: dict, new: dict, path: tuple, builder: IssueBuilder,
+                       source_root: Any, target_root: Any,
+                       source_validator, target_validator) -> None:
+    """if / then / else 条件分支比较（draft-07+）。"""
+    old_has = _has_conditional(old)
+    new_has = _has_conditional(new)
+    if not (old_has or new_has):
+        return
+
+    abs_path = builder.embed_prefix + path
+    old_if = old.get("if") if old_has else None
+    new_if = new.get("if") if new_has else None
+
+    if old_has and new_has:
+        cells = [(True, True), (False, False)]
+        if old_if != new_if:
+            # 条件表达式不同，才可能出现"源命中、目标未命中"（或相反）的路由
+            cells += [(True, False), (False, True)]
+    elif old_has:
+        cells = [(True, None), (False, None)]
+    else:
+        cells = [(None, True), (None, False)]
+
+    # 节点主检查（rest 层）已报告的问题，单元内不重复报告
+    node_rendered = builder._render(abs_path)
+    node_issue_keys = {(issue["code"], issue["reason"])
+                       for issue in builder.raw if issue["path"] == node_rendered}
+    issues_before = len(builder.raw)
+
+    for src_active, tgt_active in cells:
+        _check_conditional_cell(
+            abs_path, src_active, tgt_active,
+            old, old_if, old.get("then", True), old.get("else", True),
+            new, new_if, new.get("then", True), new.get("else", True),
+            builder, target_root, source_validator, target_validator)
+
+    if node_issue_keys:
+        # 去重只作用于本节点单元新追加的问题，避免误删其它节点的同类问题
+        builder.raw[:] = builder.raw[:issues_before] + [
+            issue for issue in builder.raw[issues_before:]
+            if (issue["code"], issue["reason"]) not in node_issue_keys
+        ]
+
+    if old_has and new_has and old_if != new_if:
+        cell_issues = builder.raw[issues_before:]
+        if not any(issue["severity"] == "error" for issue in cell_issues):
+            _check_condition_routing(
+                abs_path, old, new, old_if, new_if, builder,
+                target_root, source_validator, target_validator,
+                emit_warning=not cell_issues)
+
+
+def _check_conditional_cell(abs_path: tuple, src_active, tgt_active,
+                            old: dict, old_if: Any, old_then: Any, old_else: Any,
+                            new: dict, new_if: Any, new_then: Any, new_else: Any,
+                            builder: IssueBuilder, target_root: Any,
+                            source_validator, target_validator) -> None:
+    """比较一个激活单元（源命中 / 未命中 × 目标命中 / 未命中）。"""
+    # 永不激活的单元直接跳过，避免对不可达分支误报
+    if src_active is True and old_if is False:
+        return
+    if src_active is False and old_if is True:
+        return
+    if tgt_active is True and new_if is False:
+        return
+    if tgt_active is False and new_if is True:
+        return
+
+    both = src_active is not None and tgt_active is not None
+    # 比较用 schema：两侧都有条件时只比分支内容（rest 层差异由主检查负责，
+    # 避免重复报告）；仅一侧有条件时该侧用 rest + 分支的整体合并（摘掉
+    # 节点自身的条件键，分支内更深层嵌套的条件保留）。
+    if src_active is None:
+        src_compare = src_construct = old
+    else:
+        src_branch = old_then if src_active else old_else
+        src_construct = merge_schemas(old, src_branch)
+        src_compare = src_branch if both else _strip_conditional(src_construct)
+    if tgt_active is None:
+        tgt_compare = new
+    else:
+        tgt_branch = new_then if tgt_active else new_else
+        tgt_compare = tgt_branch if both else _strip_conditional(merge_schemas(new, tgt_branch))
+
+    if src_compare is False:
+        return  # 源分支拒绝一切：该单元没有源实例，蕴含式真空成立
+    if src_compare is True and tgt_compare is True:
+        return
+
+    # 场景化 embed root：把条件节点替换为构造用 schema（保留 if/then/else
+    # 键供嵌入导航），源无条件时直接使用原 root
+    if src_active is None:
+        embed_root = builder.source_root
+    else:
+        embed_root = _replace_at_path(builder.source_root, abs_path, src_construct)
+
+    active = src_active if src_active is not None else tgt_active
+    branch_frame = ("then",) if active else ("else",)
+
+    force_specs = list(builder.force_specs)
+    if src_active is not None:
+        force_specs.append((abs_path, old_if, src_active, src_construct))
+    if tgt_active is not None:
+        force_specs.append((abs_path, new_if, tgt_active,
+                            src_construct if src_active is not None else old))
+
+    child = IssueBuilder(embed_root, target_root, source_validator, target_validator,
+                         embed_prefix=abs_path + (branch_frame,),
+                         force_specs=force_specs, verified_only=True)
+    child.raw = builder.raw  # 单元发现的问题直接汇入主列表
+    _check(src_compare, tgt_compare, (), child, embed_root, target_root,
+           source_validator, target_validator)
+
+
+def _check_condition_routing(abs_path: tuple, old: dict, new: dict,
+                             old_if: Any, new_if: Any, builder: IssueBuilder,
+                             target_root: Any, source_validator, target_validator,
+                             emit_warning: bool) -> None:
+    """if 条件表达式变化的路由探测。
+
+    分别尝试构造"命中旧 if、未命中新 if"与"未命中旧 if、命中新 if"的
+    实例：验证通过则记 error（附反例）；都未验证且单元比较也没有发现
+    问题时，记一次 warning 提示人工确认。
+    """
+    message = "新版 if 条件发生变化，旧版实例可能被路由到不同的 then/else 分支"
+    reason = (f"旧版 if 为 {jsonish(old_if)}，新版 if 为 {jsonish(new_if)}，"
+              "对条件命中结果不同的实例，新版会套用不同的分支约束")
+    warning = None
+    for hit_old, hit_new in ((True, False), (False, True)):
+        branch = old.get("then", True) if hit_old else old.get("else", True)
+        construct = merge_schemas(old, branch)
+        if construct is False:
+            continue  # 该路由下源不接受任何实例
+        embed_root = _replace_at_path(builder.source_root, abs_path, construct)
+        force_specs = list(builder.force_specs) + [
+            (abs_path, old_if, hit_old, construct),
+            (abs_path, new_if, hit_new, construct),
+        ]
+        child = IssueBuilder(embed_root, target_root, source_validator, target_validator,
+                             embed_prefix=abs_path + (("if",),),
+                             force_specs=force_specs, verified_only=True)
+        child.add((), "if_condition_changed", message, reason,
+                  fragment=minimal_instance(construct))
+        if child.raw and child.raw[-1]["severity"] == "error":
+            builder.raw.append(child.raw[-1])
+            return
+        if child.raw:
+            warning = warning or child.raw[-1]
+    if warning is not None and emit_warning:
+        builder.raw.append(warning)
 
 
 # ---------------------------------------------------------------------------

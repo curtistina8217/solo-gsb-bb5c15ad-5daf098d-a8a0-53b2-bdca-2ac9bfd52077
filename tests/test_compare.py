@@ -160,3 +160,29 @@ class TestCompareReports:
         assert result["counts"] == {"added": 0, "fixed": 0, "persisting": 0,
                                     "severity_changed": 0}
         assert result["summary_diff"]["total"]["delta"] == 0
+
+
+class TestConditionalIssues:
+    """条件分支 issue 的指纹与分类。"""
+
+    def test_conditional_path_participates_in_fingerprint(self):
+        base = make_issue(path="#/then", code="required_added")
+        assert compare.issue_fingerprint(base) != compare.issue_fingerprint(
+            make_issue(path="#/else", code="required_added"))
+        assert compare.issue_fingerprint(base) != compare.issue_fingerprint(
+            make_issue(path="#", code="required_added"))
+
+    def test_conditional_severity_change_classified(self):
+        from app.compat import HEURISTIC_SUFFIX
+        reason = "旧版中 'y' 可以缺省，新版 required 包含该字段"
+        baseline = make_report([make_issue(
+            path="#/then", code="required_added", severity="warning",
+            reason=reason + HEURISTIC_SUFFIX)])
+        current = make_report([make_issue(
+            path="#/then", code="required_added", severity="error", reason=reason)])
+        result = compare.compare_reports(baseline, current)
+        assert result["counts"]["severity_changed"] == 1
+        changed = result["issues"]["severity_changed"][0]
+        assert changed["path"] == "#/then"
+        assert changed["baseline_severity"] == "warning"
+        assert changed["current_severity"] == "error"

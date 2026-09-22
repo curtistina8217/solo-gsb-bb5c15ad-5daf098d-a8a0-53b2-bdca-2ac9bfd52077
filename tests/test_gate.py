@@ -281,3 +281,27 @@ class TestEvaluateGate:
         gate.evaluate_gate(report, request)
         assert repr(report) == report_repr
         assert repr(request) == request_repr
+
+
+class TestConditionalPaths:
+    """条件分支（if/then/else）路径的门禁匹配。"""
+
+    def test_then_path_exact_exemption(self):
+        report = make_report([
+            make_issue(path="#/then", code="required_added", severity="error"),
+        ])
+        result = gate.evaluate_gate(report, {
+            "directions": ["backward"],
+            "exemptions": [
+                {"direction": "backward", "code": "required_added", "path": "#/then"},
+            ],
+        })
+        assert result["pass"] is True
+        assert result["exempted"][0]["rule_index"] == 0
+        assert result["counts"]["backward"]["exempted"] == 1
+
+    def test_branch_wildcard_does_not_match_deeper_segment(self):
+        # 单段 * 不匹配 #/then/properties/x 这种更深的条件分支路径
+        assert not gate.path_matches("#/then/*", "#/then/properties/x")
+        assert gate.path_matches("#/then/*/*", "#/then/properties/x")
+        assert gate.path_matches("#/if", "#/if")
